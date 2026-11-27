@@ -21,6 +21,76 @@ describe("launcher & terminal HUD", () => {
     expect(code).toBe(42);
   });
 
+  it.each([
+    {
+      name: "captures OPENAI_BASE_URL before localhost injection",
+      flags: [],
+      env: { OPENAI_BASE_URL: "https://relay.example/api/v1", OPENAI_API_BASE: "https://alias.example/v1" },
+      expected: "https://relay.example/api/v1",
+    },
+    {
+      name: "falls back to OPENAI_API_BASE",
+      flags: [],
+      env: { OPENAI_BASE_URL: "", OPENAI_API_BASE: "https://alias.example/v1" },
+      expected: "https://alias.example/v1",
+    },
+    {
+      name: "keeps an explicit upstream flag ahead of inherited destinations",
+      flags: ["--upstream-openai", "https://explicit.example/v1"],
+      env: { OPENAI_BASE_URL: "https://relay.example/api/v1", OPENAI_API_BASE: "https://alias.example/v1" },
+      expected: "https://explicit.example/v1",
+    },
+    {
+      name: "retains the OpenAI default when no destination is inherited",
+      flags: [],
+      env: {},
+      expected: undefined,
+    },
+  ])("wrap mode $name", ({ flags, env, expected }) => {
+    const args = parseArgs([...flags, "--", "codex"], env);
+    expect(args.upstreamOpenAi).toBe(expected);
+    expect(Boolean(args.upstreamOpenAiIsClientBase)).toBe(expected !== undefined && flags.length === 0);
+  });
+
+  it("captures the analogous Anthropic destination only in wrap mode, with explicit flags taking priority", () => {
+    const env = { ANTHROPIC_BASE_URL: "https://anthropic-relay.example" };
+    expect(parseArgs(["--", "claude"], env).upstreamAnthropic).toBe(env.ANTHROPIC_BASE_URL);
+    expect(parseArgs(["--upstream-anthropic", "https://explicit.example", "--", "claude"], env).upstreamAnthropic)
+      .toBe("https://explicit.example");
+    expect(parseArgs(["serve"], env).upstreamAnthropic).toBeUndefined();
+    expect(parseArgs(["serve"], { OPENAI_BASE_URL: "https://relay.example/v1" }).upstreamOpenAi).toBeUndefined();
+  });
+
+  it.each([
+    {
+      name: "prefers the Google Gemini base over the legacy alias",
+      flags: [],
+      env: { GOOGLE_GEMINI_BASE_URL: "https://primary.example/relay", GEMINI_API_BASE_URL: "https://alias.example" },
+      expected: "https://primary.example/relay",
+    },
+    {
+      name: "uses the legacy alias when the primary base is empty",
+      flags: [],
+      env: { GOOGLE_GEMINI_BASE_URL: "", GEMINI_API_BASE_URL: "https://alias.example/relay" },
+      expected: "https://alias.example/relay",
+    },
+    {
+      name: "keeps an explicit Gemini upstream ahead of inherited bases",
+      flags: ["--upstream-gemini", "https://explicit.example/relay"],
+      env: { GOOGLE_GEMINI_BASE_URL: "https://primary.example", GEMINI_API_BASE_URL: "https://alias.example" },
+      expected: "https://explicit.example/relay",
+    },
+    { name: "keeps the default when neither base is set", flags: [], env: {}, expected: undefined },
+  ])("wrap mode $name", ({ flags, env, expected }) => {
+    expect(parseArgs([...flags, "--", "gemini"], env).upstreamGemini).toBe(expected);
+  });
+
+  it("does not inherit Gemini base URLs in standalone modes", () => {
+    const env = { GOOGLE_GEMINI_BASE_URL: "https://primary.example", GEMINI_API_BASE_URL: "https://alias.example" };
+    expect(parseArgs(["serve"], env).upstreamGemini).toBeUndefined();
+    expect(parseArgs(["ui"], env).upstreamGemini).toBeUndefined();
+  });
+
   it("formats exit summary cleanly for both empty and cache-broken sessions", () => {
     const empty = formatExitSummary([], "http://127.0.0.1:4318");
     expect(empty).toContain("0 turns");

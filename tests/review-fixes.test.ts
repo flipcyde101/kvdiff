@@ -3,6 +3,8 @@ import http from "node:http";
 import { gzipSync } from "node:zlib";
 import { KvStore } from "../src/store.js";
 import { createProxyServer } from "../src/proxy/server.js";
+import { parseArgs } from "../src/cli.js";
+import { buildProxyEnv } from "../src/launcher/spawn.js";
 
 function startMockUpstream(handler: http.RequestListener): Promise<{ server: http.Server; url: string }> {
   return new Promise((resolve) => {
@@ -79,6 +81,169 @@ describe("Review Fix Regression Suite", () => {
       "/api/v1/chat/completions",
     ]);
   });
+
+  it.each(["/api/v1", "/api", "/codex"])("preserves an inherited OpenAI relay destination (%s), raw Responses body, synthetic auth/beta headers and SSE in wrap mode", async (basePath) => {
+    let seenPath = "";
+    let seenHeaders: http.IncomingHttpHeaders = {};
+    let seenBody = Buffer.alloc(0);
+    const sseText =
+      `event: response.completed\n` +
+      `data: {"type":"response.completed","response":{"usage":{"input_tokens":128,"input_tokens_details":{"cached_tokens":64},"output_tokens":3}}}\n\n`;
+    const upstream = await startMockUpstream((req, res) => {
+      seenPath = req.url ?? "";
+      seenHeaders = req.headers;
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(Buffer.from(c)));
+      req.on("end", () => {
+        seenBody = Buffer.concat(chunks);
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(sseText);
+      });
+    });
+    cleanups.push(() => closeServer(upstream.server));
+
+    const inheritedUrl = `${upstream.url}${basePath}`;
+    const parentEnv = { OPENAI_BASE_URL: inheritedUrl };
+    const args = parseArgs(["--", "codex"], parentEnv);
+    // Assert the destination before creating the proxy: the unpatched parser
+    // fails here, so this regression never reaches the real OpenAI default.
+    expect(args.upstreamOpenAi).toBe(inheritedUrl);
+    expect(args.upstreamOpenAiIsClientBase).toBe(true);
+
+    const store = new KvStore(":memory:");
+    cleanups.push(async () => store.close());
+    const proxy = await createProxyServer({
+      store,
+      port: 0,
+      heal: false,
+      defaultSessionId: "s-inherited-openai",
+      upstreamOpenAi: args.upstreamOpenAi,
+      upstreamOpenAiIsClientBase: args.upstreamOpenAiIsClientBase,
+    });
+    cleanups.push(() => proxy.close());
+
+    const childEnv = buildProxyEnv(proxy.url, "s-inherited-openai", parentEnv);
+    expect(childEnv.OPENAI_BASE_URL).toBe(`${proxy.url}/v1`);
+    expect(parentEnv.OPENAI_BASE_URL).toBe(inheritedUrl);
+    const rawBody = Buffer.from('{"model":"kvdiff-synthetic-route",  "stream":true, "input":"route-only"}');
+    const response = await fetch(`${childEnv.OPENAI_BASE_URL}/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer kvdiff-synthetic-route-only",
+        "openai-beta": "responses=v1",
+      },
+      body: rawBody,
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(sseText);
+    expect(seenPath).toBe(`${basePath}/responses`);
+    expect(seenBody.equals(rawBody)).toBe(true);
+    expect(seenHeaders.authorization).toBe("Bearer kvdiff-synthetic-route-only");
+    expect(seenHeaders["openai-beta"]).toBe("responses=v1");
+
+    await new Promise((r) => setTimeout(r, 40));
+    const turns = store.getSessionTurns("s-inherited-openai");
+    expect(turns).toHaveLength(1);
+    expect(turns[0].usage.cacheReadTokens).toBe(64);
+    expect(turns[0].usage.outputTokens).toBe(3);
+  });
+
+  it("keeps explicit non-v1 upstream flags on the original proxy-root path contract", async () => {
+    let seenPath = "";
+    const upstream = await startMockUpstream((req, res) => {
+      seenPath = req.url ?? "";
+      req.resume();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+    cleanups.push(() => closeServer(upstream.server));
+
+    const explicitUrl = `${upstream.url}/api`;
+    const args = parseArgs(["--upstream-openai", explicitUrl, "--", "codex"], {
+      OPENAI_BASE_URL: `${upstream.url}/codex`,
+    });
+    expect(args.upstreamOpenAi).toBe(explicitUrl);
+    expect(args.upstreamOpenAiIsClientBase).toBeUndefined();
+
+    const store = new KvStore(":memory:");
+    cleanups.push(async () => store.close());
+    const proxy = await createProxyServer({
+      store,
+      port: 0,
+      heal: false,
+      defaultSessionId: "s-explicit-openai-root",
+      upstreamOpenAi: args.upstreamOpenAi,
+      upstreamOpenAiIsClientBase: args.upstreamOpenAiIsClientBase,
+    });
+    cleanups.push(() => proxy.close());
+
+    const childEnv = buildProxyEnv(proxy.url, "s-explicit-openai-root", {});
+    const response = await fetch(`${childEnv.OPENAI_BASE_URL}/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"kvdiff-synthetic-route","input":"route-only"}',
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(seenPath).toBe("/api/v1/responses");
+  });
+
+  it.each(["GOOGLE_GEMINI_BASE_URL", "GEMINI_API_BASE_URL"])(
+    "routes a wrapped Gemini request through the inherited %s relay",
+    async (baseKey) => {
+      let seenPath = "";
+      let seenHeaders: http.IncomingHttpHeaders = {};
+      let seenBody = Buffer.alloc(0);
+      const reply = '{"candidates":[],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":3}}';
+      const upstream = await startMockUpstream((req, res) => {
+        seenPath = req.url ?? "";
+        seenHeaders = req.headers;
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        req.on("end", () => {
+          seenBody = Buffer.concat(chunks);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(reply);
+        });
+      });
+      cleanups.push(() => closeServer(upstream.server));
+
+      const inheritedUrl = `${upstream.url}/gemini-relay`;
+      const parentEnv = { [baseKey]: inheritedUrl };
+      const args = parseArgs(["--", "gemini"], parentEnv);
+      // Stop before starting the proxy if the inherited destination was lost.
+      expect(args.upstreamGemini).toBe(inheritedUrl);
+
+      const store = new KvStore(":memory:");
+      cleanups.push(async () => store.close());
+      const proxy = await createProxyServer({
+        store,
+        port: 0,
+        heal: false,
+        defaultSessionId: "s-inherited-gemini",
+        upstreamGemini: args.upstreamGemini,
+      });
+      cleanups.push(() => proxy.close());
+
+      const childEnv = buildProxyEnv(proxy.url, "s-inherited-gemini", parentEnv);
+      expect(childEnv[baseKey]).toBe(proxy.url);
+      const rawBody = Buffer.from('{"contents":[{"parts":[{"text":"synthetic"}]}]}');
+      const response = await fetch(
+        `${childEnv[baseKey]}/v1beta/models/gemini-2.5-pro:generateContent?alt=json`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-goog-api-key": "synthetic-only" },
+          body: rawBody,
+        }
+      );
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe(reply);
+      expect(seenPath).toBe("/gemini-relay/v1beta/models/gemini-2.5-pro:generateContent?alt=json");
+      expect(seenHeaders["x-goog-api-key"]).toBe("synthetic-only");
+      expect(seenBody.equals(rawBody)).toBe(true);
+    }
+  );
 
   it("Fix #2: decompresses gzip SSE streams in tee parser without losing token usage", async () => {
     const sseText =
