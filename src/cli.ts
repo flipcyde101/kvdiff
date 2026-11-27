@@ -18,6 +18,7 @@ export interface ParsedArgs {
   dbPath: string;
   upstreamAnthropic?: string;
   upstreamOpenAi?: string;
+  upstreamOpenAiIsClientBase?: boolean;
   upstreamGemini?: string;
   upstreamLocal?: string;
   wrappedCommand: string[];
@@ -46,7 +47,7 @@ Options:
   -h, --help                   Show this help`);
 }
 
-export function parseArgs(argv: string[]): ParsedArgs {
+export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env): ParsedArgs {
   const sepIdx = argv.indexOf("--");
   const kvArgs = sepIdx >= 0 ? argv.slice(0, sepIdx) : argv;
   const wrappedCommand = sepIdx >= 0 ? argv.slice(sepIdx + 1) : [];
@@ -104,6 +105,20 @@ export function parseArgs(argv: string[]): ParsedArgs {
     } else if (arg.startsWith("-")) {
       throw new Error(`Unknown option: ${arg}. Run "kvdiff --help" for usage.`);
     }
+  }
+
+  // Capture the child's current destinations before buildProxyEnv redirects it to
+  // localhost. Explicit upstream flags retain priority; standalone serve/ui
+  // keep their existing defaults.
+  if (parsed.mode === "wrap") {
+    if (parsed.upstreamOpenAi === undefined) {
+      const inheritedOpenAi = env.OPENAI_BASE_URL || env.OPENAI_API_BASE;
+      if (inheritedOpenAi) {
+        parsed.upstreamOpenAi = inheritedOpenAi;
+        parsed.upstreamOpenAiIsClientBase = true;
+      }
+    }
+    parsed.upstreamAnthropic ??= env.ANTHROPIC_BASE_URL || undefined;
   }
 
   return parsed;
@@ -192,6 +207,7 @@ async function main(): Promise<void> {
     defaultSessionId: sessionId,
     upstreamAnthropic: args.upstreamAnthropic,
     upstreamOpenAi: args.upstreamOpenAi,
+    upstreamOpenAiIsClientBase: args.upstreamOpenAiIsClientBase,
     upstreamGemini: args.upstreamGemini,
     upstreamLocal: args.upstreamLocal,
   });

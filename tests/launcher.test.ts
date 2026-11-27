@@ -21,6 +21,46 @@ describe("launcher & terminal HUD", () => {
     expect(code).toBe(42);
   });
 
+  it.each([
+    {
+      name: "captures OPENAI_BASE_URL before localhost injection",
+      flags: [],
+      env: { OPENAI_BASE_URL: "https://relay.example/api/v1", OPENAI_API_BASE: "https://alias.example/v1" },
+      expected: "https://relay.example/api/v1",
+    },
+    {
+      name: "falls back to OPENAI_API_BASE",
+      flags: [],
+      env: { OPENAI_BASE_URL: "", OPENAI_API_BASE: "https://alias.example/v1" },
+      expected: "https://alias.example/v1",
+    },
+    {
+      name: "keeps an explicit upstream flag ahead of inherited destinations",
+      flags: ["--upstream-openai", "https://explicit.example/v1"],
+      env: { OPENAI_BASE_URL: "https://relay.example/api/v1", OPENAI_API_BASE: "https://alias.example/v1" },
+      expected: "https://explicit.example/v1",
+    },
+    {
+      name: "retains the OpenAI default when no destination is inherited",
+      flags: [],
+      env: {},
+      expected: undefined,
+    },
+  ])("wrap mode $name", ({ flags, env, expected }) => {
+    const args = parseArgs([...flags, "--", "codex"], env);
+    expect(args.upstreamOpenAi).toBe(expected);
+    expect(Boolean(args.upstreamOpenAiIsClientBase)).toBe(expected !== undefined && flags.length === 0);
+  });
+
+  it("captures the analogous Anthropic destination only in wrap mode, with explicit flags taking priority", () => {
+    const env = { ANTHROPIC_BASE_URL: "https://anthropic-relay.example" };
+    expect(parseArgs(["--", "claude"], env).upstreamAnthropic).toBe(env.ANTHROPIC_BASE_URL);
+    expect(parseArgs(["--upstream-anthropic", "https://explicit.example", "--", "claude"], env).upstreamAnthropic)
+      .toBe("https://explicit.example");
+    expect(parseArgs(["serve"], env).upstreamAnthropic).toBeUndefined();
+    expect(parseArgs(["serve"], { OPENAI_BASE_URL: "https://relay.example/v1" }).upstreamOpenAi).toBeUndefined();
+  });
+
   it("formats exit summary cleanly for both empty and cache-broken sessions", () => {
     const empty = formatExitSummary([], "http://127.0.0.1:4318");
     expect(empty).toContain("0 turns");
