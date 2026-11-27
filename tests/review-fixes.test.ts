@@ -189,6 +189,62 @@ describe("Review Fix Regression Suite", () => {
     expect(seenPath).toBe("/api/v1/responses");
   });
 
+  it.each(["GOOGLE_GEMINI_BASE_URL", "GEMINI_API_BASE_URL"])(
+    "routes a wrapped Gemini request through the inherited %s relay",
+    async (baseKey) => {
+      let seenPath = "";
+      let seenHeaders: http.IncomingHttpHeaders = {};
+      let seenBody = Buffer.alloc(0);
+      const reply = '{"candidates":[],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":3}}';
+      const upstream = await startMockUpstream((req, res) => {
+        seenPath = req.url ?? "";
+        seenHeaders = req.headers;
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        req.on("end", () => {
+          seenBody = Buffer.concat(chunks);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(reply);
+        });
+      });
+      cleanups.push(() => closeServer(upstream.server));
+
+      const inheritedUrl = `${upstream.url}/gemini-relay`;
+      const parentEnv = { [baseKey]: inheritedUrl };
+      const args = parseArgs(["--", "gemini"], parentEnv);
+      // Stop before starting the proxy if the inherited destination was lost.
+      expect(args.upstreamGemini).toBe(inheritedUrl);
+
+      const store = new KvStore(":memory:");
+      cleanups.push(async () => store.close());
+      const proxy = await createProxyServer({
+        store,
+        port: 0,
+        heal: false,
+        defaultSessionId: "s-inherited-gemini",
+        upstreamGemini: args.upstreamGemini,
+      });
+      cleanups.push(() => proxy.close());
+
+      const childEnv = buildProxyEnv(proxy.url, "s-inherited-gemini", parentEnv);
+      expect(childEnv[baseKey]).toBe(proxy.url);
+      const rawBody = Buffer.from('{"contents":[{"parts":[{"text":"synthetic"}]}]}');
+      const response = await fetch(
+        `${childEnv[baseKey]}/v1beta/models/gemini-2.5-pro:generateContent?alt=json`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-goog-api-key": "synthetic-only" },
+          body: rawBody,
+        }
+      );
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe(reply);
+      expect(seenPath).toBe("/gemini-relay/v1beta/models/gemini-2.5-pro:generateContent?alt=json");
+      expect(seenHeaders["x-goog-api-key"]).toBe("synthetic-only");
+      expect(seenBody.equals(rawBody)).toBe(true);
+    }
+  );
+
   it("Fix #2: decompresses gzip SSE streams in tee parser without losing token usage", async () => {
     const sseText =
       `event: message_start\n` +
