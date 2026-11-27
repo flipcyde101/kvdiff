@@ -31,6 +31,7 @@ export interface ProxyServerOptions {
   defaultSessionId: string;
   upstreamAnthropic?: string;
   upstreamOpenAi?: string;
+  upstreamOpenAiIsClientBase?: boolean;
   upstreamGemini?: string;
   upstreamLocal?: string;
   uiDir?: string;
@@ -72,13 +73,15 @@ function normalizeIncomingUrl(rawUrl: string): { pathname: string; search: strin
   return { pathname, search, normalized: `${pathname}${search}` };
 }
 
-function buildUpstreamUrl(upstreamBase: string, pathname: string, search: string): URL {
+function buildUpstreamUrl(upstreamBase: string, pathname: string, search: string, isClientBase = false): URL {
   const base = new URL(upstreamBase);
   const basePath = base.pathname.replace(/\/+$/, "");
   let reqPath = pathname;
 
-  // Deduplicate overlapping `/v1` when base already ends in `/v1` (e.g. OpenRouter `/api/v1`)
-  if (basePath.endsWith("/v1") && (reqPath === "/v1" || reqPath.startsWith("/v1/"))) {
+  // A captured client base already contains its complete API prefix; `/v1`
+  // belongs to our injected localhost base, not necessarily the upstream.
+  // Explicit upstream flags retain the existing overlapping-/v1 behavior.
+  if ((isClientBase || basePath.endsWith("/v1")) && (reqPath === "/v1" || reqPath.startsWith("/v1/"))) {
     reqPath = reqPath.slice(3) || "/";
   }
 
@@ -272,7 +275,12 @@ export async function createProxyServer(opts: ProxyServerOptions): Promise<{
       const inspectReqBuf = decompressIfNeeded(rawReqBuf, req.headers["content-encoding"]);
       const provider = detectProvider(normalized, req.headers, Boolean(opts.upstreamLocal));
       const upstreamBase = resolveUpstreamBase(provider, opts);
-      const upstreamUrl = buildUpstreamUrl(upstreamBase, pathname, search);
+      const upstreamUrl = buildUpstreamUrl(
+        upstreamBase,
+        pathname,
+        search,
+        provider === "openai" && Boolean(opts.upstreamOpenAiIsClientBase)
+      );
 
       let forwardReqBuf = rawReqBuf;
       let healed = false;
