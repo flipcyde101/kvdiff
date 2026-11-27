@@ -119,6 +119,7 @@ export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env):
       }
     }
     parsed.upstreamAnthropic ??= env.ANTHROPIC_BASE_URL || undefined;
+    parsed.upstreamGemini ??= env.GOOGLE_GEMINI_BASE_URL || env.GEMINI_API_BASE_URL || undefined;
   }
 
   return parsed;
